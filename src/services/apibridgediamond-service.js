@@ -17,6 +17,8 @@ class APIBridgeDiamondService {
         this.idempotency = {};
         this.running = false;
         this.ready = false;
+        this.saveTail = Promise.resolve();
+        this.lastError = null;
     }
 
     async init() {
@@ -32,6 +34,7 @@ class APIBridgeDiamondService {
             await this.save();
         }
         this.ready = true;
+        this.scheduleDrain();
         return this;
     }
 
@@ -71,7 +74,7 @@ class APIBridgeDiamondService {
         this.deliveries[id] = delivery;
         if (key) this.idempotency[`${routeName}:${key}`] = id;
         await this.save();
-        queueMicrotask(() => this.drain());
+        this.scheduleDrain();
         return delivery;
     }
 
@@ -82,14 +85,19 @@ class APIBridgeDiamondService {
         await this.ensureReady();
         const counts = { queued: 0, delivering: 0, delivered: 0, failed: 0 };
         for (const item of Object.values(this.deliveries)) counts[item.status] += 1;
-        return { routes: Object.keys(this.routes).length, deliveries: Object.keys(this.deliveries).length, ...counts };
+        return { routes: Object.keys(this.routes).length, deliveries: Object.keys(this.deliveries).length, ...counts, lastError: this.lastError };
+    }
+
+    scheduleDrain() {
+        queueMicrotask(() => this.drain().catch(error => { this.lastError = error.message; }));
     }
 
     async drain() {
         if (this.running) return;
         this.running = true;
         try {
-            for (const delivery of Object.values(this.deliveries).filter(item => item.status === 'queued')) await this.deliver(delivery);
+            let delivery;
+            while ((delivery = Object.values(this.deliveries).find(item => item.status === 'queued'))) await this.deliver(delivery);
         } finally { this.running = false; }
     }
 
@@ -98,8 +106,15 @@ class APIBridgeDiamondService {
         if (!route) { delivery.status = 'failed'; delivery.error = 'Route was removed'; await this.save(); return; }
         const body = JSON.stringify({ id: delivery.id, createdAt: delivery.createdAt, data: delivery.payload });
         delivery.status = 'delivering';
+        if (delivery.attempts >= this.maxAttempts) {
+            delivery.status = 'failed';
+            delivery.error = 'Delivery attempt limit reached before restart';
+            await this.save();
+            return;
+        }
         for (let attempt = delivery.attempts + 1; attempt <= this.maxAttempts; attempt += 1) {
             delivery.attempts = attempt;
+            await this.save();
             try {
                 const headers = { 'content-type': 'application/json', 'x-api-bridge-delivery': delivery.id };
                 if (route.secret) headers['x-api-bridge-signature-256'] = `sha256=${crypto.createHmac('sha256', route.secret).update(body).digest('hex')}`;
@@ -120,10 +135,15 @@ class APIBridgeDiamondService {
         await this.save();
     }
 
-    async save() {
-        const temporary = `${this.dataFile}.${process.pid}.tmp`;
-        await fs.writeFile(temporary, `${JSON.stringify({ routes: this.routes, deliveries: this.deliveries, idempotency: this.idempotency }, null, 2)}\n`, { mode: 0o600 });
-        await fs.rename(temporary, this.dataFile);
+    save() {
+        const snapshot = `${JSON.stringify({ routes: this.routes, deliveries: this.deliveries, idempotency: this.idempotency }, null, 2)}\n`;
+        const operation = this.saveTail.then(async () => {
+            const temporary = `${this.dataFile}.${process.pid}.tmp`;
+            await fs.writeFile(temporary, snapshot, { mode: 0o600 });
+            await fs.rename(temporary, this.dataFile);
+        });
+        this.saveTail = operation.catch(() => {});
+        return operation;
     }
 
     async ensureReady() { if (!this.ready) await this.init(); }

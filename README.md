@@ -71,6 +71,8 @@ MIT © cent
 
 ## Current limitations
 
+- Restart recovery automatically resumes pending deliveries within their attempt limit. A crash after a receiver processes a request but before acknowledgement is saved can cause duplicate delivery; receivers should deduplicate `X-API-Bridge-Delivery`.
+- The API has no built-in authentication. Run it on a trusted network or behind an authenticated proxy that restricts route administration and publishing. Restrict outbound destinations and redirects at the network boundary; caller-selected webhook URLs can otherwise reach internal services.
 - Delivery acknowledgement confirms the destination HTTP response, not the destination application's internal side effects.
 - The file-backed queue is designed for a single service instance, not a distributed cluster.
 - Operators must secure route configuration, signing secrets, storage, and network access.
